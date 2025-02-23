@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import glob
 import pandas as pd
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
@@ -20,9 +21,21 @@ parser.add_argument("--output-file-or-path", type=str, required=True, help="Outp
 parser.add_argument("--file-format", type=str, choices=["jsonl", "parquet"], default="jsonl", help="Output file format")
 parser.add_argument("--file-size", type=int, default=1, help="File size limit in GB before creating a new file")
 parser.add_argument("--file-flush", action="store_true", help="Store each batch in real-time")
+parser.add_argument("--resume", action="store_true", help="Resume from last progress")
 parser.add_argument("--template", type=str, required=True, help="Prompt template")
 parser.add_argument("--system-prompt", type=str, required=True, help="System prompt (file path or string)")
 args = parser.parse_args()
+
+# Check if output path is a directory and create it if necessary
+if args.output_file_or_path.endswith("/"):
+    os.makedirs(args.output_file_or_path, exist_ok=True)
+    args.output_file_or_path = os.path.join(args.output_file_or_path, "output")
+
+# Save configuration to the same folder as output
+config_path = os.path.join(os.path.dirname(args.output_file_or_path), "config.json")
+config_data = vars(args)
+with open(config_path, "w") as config_file:
+    json.dump(config_data, config_file, indent=4)
 
 # Load system instruction
 try:
@@ -39,7 +52,7 @@ except Exception as e:
 # Initialize the vLLM engine
 llm = LLM(
     model=args.model,
-    tensor_parallel_size=2,
+    tensor_parallel_size=args.tp,
     quantization=args.quantization,
     enforce_eager=args.enforce_eager,
     gpu_memory_utilization=args.gpu_memory_utilization,
@@ -57,10 +70,27 @@ sampling_params = SamplingParams(
 # Load the dataset
 dataset = load_dataset(args.dataset, split="train")
 
+# Track progress if resuming
+processed_questions = set()
+if args.resume:
+    output_files = glob.glob(f"{args.output_file_or_path}.*.{args.file_format}")
+    for output_file in output_files:
+        if args.file_format == "jsonl":
+            with open(output_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        processed_questions.add(data.get("question"))
+                    except json.JSONDecodeError:
+                        continue
+        elif args.file_format == "parquet":
+            df = pd.read_parquet(output_file)
+            processed_questions.update(df["question"].tolist())
+
 # Prepare for batch processing
 batch_questions = []
 batch_rows = []
-file_index = 0
+file_index = len(output_files)
 current_file_size = 0
 
 def write_results(results):
@@ -83,6 +113,9 @@ def write_results(results):
         current_file_size = 0
 
 for row in tqdm(dataset, desc="Generating responses"):
+    if row['question'] in processed_questions:
+        continue  # Skip already processed questions
+    
     # Prepare chat messages for each row
     messages = [
         {"role": "system", "content": system_instruction},
@@ -118,3 +151,4 @@ if batch_questions:
     write_results(results)
 
 print(f"Dataset generation complete. Results saved to {args.output_file_or_path}")
+
